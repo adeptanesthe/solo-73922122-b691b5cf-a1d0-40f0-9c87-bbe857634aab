@@ -110,3 +110,81 @@ def test_live_end_to_end():
         ("zh", 0, 4),
         ("en", 5, 7),
     ]
+
+
+def test_live_final_chunk_resend_and_normal_chunk_resend():
+    status, _ = _get("/healthz")
+    assert status == 200
+
+    status, session = _post(
+        "/sessions",
+        {
+            "languages": ["zh", "en"],
+            "frame_ms": 20,
+            "switch_frames": 3,
+            "posterior_threshold": 0.55,
+        },
+    )
+    assert status == 201, session
+    sid = session["session_id"]
+
+    first_chunk = {"start_seq": 0, "posteriors": [_frame(0) for _ in range(5)]}
+    status, first = _post(f"/sessions/{sid}/chunks", first_chunk)
+    assert status == 200, first
+
+    last = {"start_seq": 5, "posteriors": [_frame(1) for _ in range(5)], "final": True}
+    status, first_final = _post(f"/sessions/{sid}/chunks", last)
+    assert status == 200, first_final
+    assert first_final["sealed"] is True and first_final["open_segment"] is None
+    expected = [("zh", 0, 4), ("en", 5, 9)]
+    assert [(s["language"], s["start_frame"], s["end_frame"]) for s in first_final["segments"]] == expected
+
+    # 末块原样重送：与首次回执、封存查询都一致，open_segment 为 null。
+    status, dup_final = _post(f"/sessions/{sid}/chunks", last)
+    assert status == 200, dup_final
+    assert dup_final["duplicate"] is True and dup_final["sealed"] is True
+    assert dup_final["open_segment"] is None
+    for key in ("segments", "start_seq", "end_seq", "next_seq"):
+        assert dup_final[key] == first_final[key], key
+    status, sealed = _get(f"/sessions/{sid}/segments")
+    assert sealed["segments"] == dup_final["segments"]
+
+    # 同序号仅改 final → 409，封存状态与区间不变。
+    status, conflict = _post(f"/sessions/{sid}/chunks", {**last, "final": False})
+    assert status == 409 and conflict["error"]["code"] == "chunk_conflict"
+    status, sealed_again = _get(f"/sessions/{sid}/segments")
+    assert sealed_again == sealed
+
+    # 封存后重送普通块：返回当时的回执，sealed 报告当前状态。
+    status, dup_first = _post(f"/sessions/{sid}/chunks", first_chunk)
+    assert status == 200 and dup_first["duplicate"] is True
+    assert dup_first["sealed"] is True
+    assert dup_first["segments"] == first["segments"] == []
+    assert dup_first["open_segment"] == first["open_segment"]
+
+    # 另起会话验证普通块重送 + 后续切点回退不改写旧回执。
+    status, session2 = _post(
+        "/sessions",
+        {"languages": ["zh", "en"], "frame_ms": 20, "switch_frames": 3},
+    )
+    sid2 = session2["session_id"]
+    c0 = {"start_seq": 0, "posteriors": [_frame(0) for _ in range(5)]}
+    c1 = {"start_seq": 5, "posteriors": [_frame(1)]}
+    c2 = {"start_seq": 6, "posteriors": [_frame(1), _frame(1)]}
+    _, r0 = _post(f"/sessions/{sid2}/chunks", c0)
+    _, r1 = _post(f"/sessions/{sid2}/chunks", c1)
+    _, r2 = _post(f"/sessions/{sid2}/chunks", c2)
+    assert r1["open_segment"]["end_frame"] == 5
+    assert r2["segments"][-1]["end_frame"] == 4  # 切点回退
+
+    status, d1 = _post(f"/sessions/{sid2}/chunks", c1)
+    assert status == 200 and d1["duplicate"] is True
+    assert d1["segments"] == r1["segments"] == []
+    assert d1["open_segment"] == r1["open_segment"]
+    assert d1["pending_language"] == "en" and d1["pending_frames"] == 1
+    assert d1["next_seq"] == 6
+
+    status, d0 = _post(f"/sessions/{sid2}/chunks", c0)
+    assert status == 200 and d0["duplicate"] is True
+    assert d0["segments"] == r0["segments"] == []
+    assert d0["open_segment"] == r0["open_segment"]

@@ -246,6 +246,208 @@ def test_duplicate_after_seal_still_returns_original(client: TestClient):
     assert dup.json()["segments"] == first["segments"]
 
 
+# ------------------------------------------------- 带 final 的末块重送（回归）
+def _final_last_chunk_session(client: TestClient) -> tuple[str, dict, dict]:
+    """两段会话：zh 0..4，en 5..9；末块带 final 封存。返回 (sid, 末块, 首次回执)。"""
+    s = make_session(client)
+    sid = s["session_id"]
+    client.post(
+        f"/sessions/{sid}/chunks",
+        json={"start_seq": 0, "posteriors": [strong(0, 2) for _ in range(5)]},
+    )
+    last = {
+        "start_seq": 5,
+        "posteriors": [strong(1, 2) for _ in range(5)],
+        "final": True,
+    }
+    first = client.post(f"/sessions/{sid}/chunks", json=last)
+    assert first.status_code == 200, first.text
+    assert first.json()["sealed"] is True
+    return sid, last, first.json()
+
+
+def test_final_last_chunk_resend_matches_first_receipt_and_seal_query(client: TestClient):
+    sid, last, first = _final_last_chunk_session(client)
+    # 首次回执：末段已封存进 segments，open_segment 为 null。
+    assert first["duplicate"] is False
+    assert first["open_segment"] is None
+    assert [(x["language"], x["start_frame"], x["end_frame"]) for x in first["segments"]] == [
+        ("zh", 0, 4),
+        ("en", 5, 9),
+    ]
+
+    dup = client.post(f"/sessions/{sid}/chunks", json=last)
+    assert dup.status_code == 200, dup.text
+    d = dup.json()
+    assert d["duplicate"] is True
+    assert d["sealed"] is True
+    # 重送回执与首次回执逐字段一致，末块区间不会退化为临时尾段。
+    for key in ("start_seq", "end_seq", "segments", "open_segment", "next_seq"):
+        assert d[key] == first[key], key
+    assert d["open_segment"] is None
+
+    # 与封存查询（GET /segments）完全一致。
+    sealed = client.get(f"/sessions/{sid}/segments").json()
+    assert d["segments"] == sealed["segments"]
+    assert sealed["sealed"] is True
+
+    # 会话状态没有被重送改变。
+    again = client.get(f"/sessions/{sid}/segments").json()
+    assert again == sealed
+
+
+def test_same_seq_only_final_changed_returns_409_and_keeps_state(client: TestClient):
+    s = make_session(client)
+    sid = s["session_id"]
+    chunk = {"start_seq": 0, "posteriors": [strong(0, 2) for _ in range(4)]}
+    client.post(f"/sessions/{sid}/chunks", json=chunk)
+    before = client.get(f"/sessions/{sid}").json()
+
+    conflict = client.post(f"/sessions/{sid}/chunks", json={**chunk, "final": True})
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "chunk_conflict"
+    after = client.get(f"/sessions/{sid}").json()
+    assert after == before
+    assert after["sealed"] is False  # 冲突请求没有顺手封存
+
+    # 反向：同一 final 块的 final 改为 false 也是冲突，且封存状态不变。
+    sid2, last, _ = _final_last_chunk_session(client)
+    sealed_before = client.get(f"/sessions/{sid2}/segments").json()
+    conflict2 = client.post(f"/sessions/{sid2}/chunks", json={**last, "final": False})
+    assert conflict2.status_code == 409
+    assert conflict2.json()["error"]["code"] == "chunk_conflict"
+    assert client.get(f"/sessions/{sid2}/segments").json() == sealed_before
+
+
+def test_normal_chunk_resend_returns_receipt_as_of_then(client: TestClient):
+    s = make_session(client, switch_frames=3)
+    sid = s["session_id"]
+    chunk0 = {"start_seq": 0, "posteriors": [strong(0, 2) for _ in range(5)]}
+    chunk1 = {"start_seq": 5, "posteriors": [strong(1, 2)]}
+    chunk2 = {"start_seq": 6, "posteriors": [strong(1, 2) for _ in range(2)]}
+    first0 = client.post(f"/sessions/{sid}/chunks", json=chunk0).json()
+    first1 = client.post(f"/sessions/{sid}/chunks", json=chunk1).json()
+    client.post(f"/sessions/{sid}/chunks", json=chunk2)
+
+    for chunk, first in ((chunk0, first0), (chunk1, first1)):
+        dup = client.post(f"/sessions/{sid}/chunks", json=chunk)
+        assert dup.status_code == 200, dup.text
+        d = dup.json()
+        assert d["duplicate"] is True
+        assert d["segments"] == first["segments"]
+        assert d["open_segment"] == first["open_segment"]
+        assert d["current_language"] == first["current_language"]
+        assert d["pending_language"] == first["pending_language"]
+        assert d["pending_frames"] == first["pending_frames"]
+        assert d["next_seq"] == first["next_seq"]
+
+    # 当时 chunk0 还没有任何已关闭区间、尾段是 zh 0..4；chunk1 时尾段延伸到 5。
+    assert first0["segments"] == [] and first0["open_segment"]["end_frame"] == 4
+    assert first1["open_segment"]["end_frame"] == 5 and first1["next_seq"] == 6
+    # 但重送时当前已关闭区间是 zh 0..4（切点回退到 4），旧回执不应被改写。
+    state = client.get(f"/sessions/{sid}").json()
+    assert [(x["language"], x["start_frame"], x["end_frame"]) for x in state["segments"]] == [
+        ("zh", 0, 4)
+    ]
+
+
+def test_old_receipt_keeps_its_tail_when_later_switch_regresses_cut(client: TestClient):
+    """确认切换让旧段切点回退（5 帧 jitter 后的 en 只回溯 3 帧），旧回执仍保留尾巴。"""
+    s = make_session(client, switch_frames=3)
+    sid = s["session_id"]
+    chunks = [
+        {"start_seq": 0, "posteriors": [strong(0, 2) for _ in range(5)]},
+        {"start_seq": 5, "posteriors": [strong(1, 2)]},
+        {"start_seq": 6, "posteriors": [strong(1, 2) for _ in range(2)]},
+    ]
+    first1 = client.post(f"/sessions/{sid}/chunks", json=chunks[0]).json()
+    first1 = client.post(f"/sessions/{sid}/chunks", json=chunks[1]).json()
+    # 当时 en 还是候选、zh 尾段延伸到第 5 帧。
+    assert first1["pending_language"] == "en" and first1["pending_frames"] == 1
+    assert first1["open_segment"]["language"] == "zh"
+    assert first1["open_segment"]["end_frame"] == 5
+
+    after = client.post(f"/sessions/{sid}/chunks", json=chunks[2]).json()
+    # 确认切换：zh 段在候选起点前一帧关闭（4 < 旧回执的 5），切点回退了。
+    assert [(x["language"], x["start_frame"], x["end_frame"]) for x in after["segments"]] == [
+        ("zh", 0, 4)
+    ]
+    assert after["open_segment"]["language"] == "en"
+    assert after["open_segment"]["start_frame"] == 5
+
+    dup = client.post(f"/sessions/{sid}/chunks", json=chunks[1]).json()
+    assert dup["duplicate"] is True
+    assert dup["open_segment"] == first1["open_segment"]
+    assert dup["open_segment"]["end_frame"] == 5  # 不被后来回退后的 4 覆盖
+    assert dup["segments"] == first1["segments"] == []
+    assert dup["pending_frames"] == 1
+    assert dup["next_seq"] == 6
+
+
+def test_resend_does_not_rerun_hmm(client: TestClient, monkeypatch):
+    s = make_session(client)
+    sid = s["session_id"]
+    chunk = {"start_seq": 0, "posteriors": [strong(0, 2) for _ in range(5)]}
+    client.post(f"/sessions/{sid}/chunks", json=chunk)
+    smoother = _sessions[sid]
+    calls = []
+    original = smoother._forward
+    monkeypatch.setattr(
+        smoother, "_forward", lambda row: (calls.append(1), original(row))[1]
+    )
+    alpha_before = smoother._log_alpha.copy()
+
+    dup = client.post(f"/sessions/{sid}/chunks", json=chunk)
+    assert dup.status_code == 200 and dup.json()["duplicate"] is True
+    assert calls == []  # 重送走缓存，不重跑前向滤波
+    assert np.array_equal(smoother._log_alpha, alpha_before)
+    assert smoother.next_seq == 5
+
+
+def test_session_memory_grows_linearly_with_chunks_plus_closed_segments():
+    """单会话为分段与回执保留的内存随 (已收块数 + 已关闭区间数) 线性增长。
+
+    既统计可达的独立 Segment 对象数，也统计容器里指向 Segment 的**引用槽**数：
+    若每条回执都复制/引用整份区间列表，引用槽会随两者之积（平方级）增长。
+    """
+    import gc
+
+    from app.smoother import Segment
+
+    def segment_stats(obj) -> tuple[int, int]:
+        seen, stack = set(), [obj]
+        unique, slots = 0, 0
+        while stack:
+            cur = stack.pop()
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            if type(cur) is Segment:
+                unique += 1
+                continue
+            if isinstance(cur, (list, tuple)):
+                slots += sum(1 for item in cur if type(item) is Segment)
+            stack.extend(gc.get_referents(cur))
+        return unique, slots
+
+    num_chunks = 40
+    params = dict(frame_ms=20, switch_frames=2, posterior_threshold=0.55)
+    sm = LanguageSmoother("mem", ["zh", "en"], **params)
+    # 每块 4 帧、方向每块翻转：块与块之间都发生一次确认切换 → 已关闭区间 ~ 块数。
+    for i in range(num_chunks):
+        rows = np.array([strong(i % 2, 2) for _ in range(4)])
+        sm.submit_chunk(i * 4, rows)
+    closed = len(sm._segments)
+    assert closed >= num_chunks // 2  # 确实有大量已关闭区间
+    assert len(sm._chunk_cache) == num_chunks
+
+    unique, slots = segment_stats(sm)
+    assert unique <= closed + num_chunks + 3, (unique, closed, num_chunks)
+    assert slots <= closed + num_chunks + 3, (slots, closed, num_chunks)
+    # 朴素实现每条回执保存整份列表时，引用槽约为 sum(i) ≈ 780；这里必须远小于。
+    assert slots < num_chunks * (closed / 2)
+
+
 # ------------------------------------------------------------- 迟到 / 越界
 def test_late_chunk_rejected_without_state_change(client: TestClient):
     s = make_session(client)

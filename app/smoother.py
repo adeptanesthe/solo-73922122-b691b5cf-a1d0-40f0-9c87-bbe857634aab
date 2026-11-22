@@ -14,11 +14,17 @@
      起点回退到会话第 0 帧（其前的低置信/抖动帧并入首段，保证时间线连续）；
    - 段内切换同样需要新语种连续 ``switch_frames`` 帧才切段，抖动期帧仍归
      旧段（切点回退到候选起点，帧不丢失、区间首尾相接）。
-3. **幂等与顺序**：按块起始序号缓存结果与内容指纹。完全相同的重放直接返回
-   原结果且不改变会话；同起点但内容/长度不同返回 409；迟到（起点小于期望
-   序号）或越界（起点大于期望序号）的块一律 409 且不改变会话。
+3. **幂等与顺序**：按块起始序号缓存"当时的回执"与内容指纹。完全相同的重放
+   （含 ``final`` 标志）直接返回原回执且不改变会话、不重跑 HMM；同起点但
+   内容/长度/``final`` 不同返回 409；迟到（起点小于期望序号）或越界（起点
+   大于期望序号）的块一律 409 且不改变会话。
 4. **封存**：``seal`` 后区间固化，未闭合尾段按最后一帧封口；此后新块被拒绝
-   （已缓存块的重放仍返回原结果）。
+   （已缓存块的重放仍返回原回执）。带 ``final`` 的块在首次处理时即封存，
+   其缓存回执就是封存后的完整区间。
+5. **回执快照与内存**：每条缓存只保存"当时已关闭区间数 + 当时尾段快照 + 当时
+   切换进度"，不复制整份区间列表。已关闭区间只追加、元素不再修改，因此旧回执
+   能原样重现当时的切点（即使后续确认切换让切点回退）；单会话长期占用随
+   "已收块数 + 已关闭区间数" 线性增长。
 """
 
 from __future__ import annotations
@@ -100,6 +106,25 @@ class ChunkResult:
         }
 
 
+@dataclass
+class _CachedChunk:
+    """某块被接受时的回执快照（O(1)，不复制区间列表）。
+
+    已关闭区间只追加、不再修改，因此用"当时已关闭数量"即可无损重建当时的
+    区间前缀；当时的临时尾段另存一份独立快照，后续切点回退不会影响它。
+    """
+
+    end_seq: int
+    fingerprint: str
+    final: bool
+    closed_count: int
+    open_segment: Optional[Segment]
+    current_language: Optional[str]
+    pending_language: Optional[str]
+    pending_frames: int
+    next_seq: int
+
+
 def _fingerprint(posteriors: np.ndarray) -> str:
     """内容指纹：识别"同起点但内容不同"的冲突块。"""
     arr = np.ascontiguousarray(np.round(posteriors, 9), dtype=np.float64)
@@ -166,7 +191,7 @@ class LanguageSmoother:
         self._frames_committed = 0
 
         # 幂等缓存与封存。
-        self._chunk_cache: Dict[int, dict] = {}
+        self._chunk_cache: Dict[int, _CachedChunk] = {}
         self._sealed = False
         self._final_segments: Optional[List[Segment]] = None
 
@@ -209,7 +234,9 @@ class LanguageSmoother:
         return self.languages[self._last_confirmed]
 
     # ------------------------------------------------------------------ 输入
-    def submit_chunk(self, start_seq: int, posteriors: np.ndarray) -> ChunkResult:
+    def submit_chunk(
+        self, start_seq: int, posteriors: np.ndarray, final: bool = False
+    ) -> ChunkResult:
         arr = self._validate_chunk(start_seq, posteriors)
         num = int(arr.shape[0])
         end_seq = start_seq + num - 1
@@ -217,13 +244,18 @@ class LanguageSmoother:
 
         cached = self._chunk_cache.get(start_seq)
         if cached is not None:
-            if cached["end_seq"] != end_seq or cached["fingerprint"] != fp:
+            # 只有内容、长度、final 三者都相同的重送才是幂等重放。
+            if (
+                cached.end_seq != end_seq
+                or cached.fingerprint != fp
+                or cached.final != final
+            ):
                 raise SessionError(
                     409,
                     "chunk_conflict",
-                    "start_seq was already submitted with different content or length",
+                    "start_seq was already submitted with different content, length or final flag",
                 )
-            return self._rebuild_cached(cached)
+            return self._rebuild_cached(start_seq, cached)
 
         if self._sealed:
             raise SessionError(
@@ -245,11 +277,24 @@ class LanguageSmoother:
             )
 
         result = self._apply(start_seq, end_seq, arr)
-        self._chunk_cache[start_seq] = {
-            "end_seq": end_seq,
-            "fingerprint": fp,
-            "result": result,
-        }
+        # 先记录"处理完本块、封存前"的回执快照。
+        self._chunk_cache[start_seq] = _CachedChunk(
+            end_seq=end_seq,
+            fingerprint=fp,
+            final=final,
+            closed_count=len(self._segments),
+            open_segment=_copy_segment(self._open_segment),
+            current_language=result.current_language,
+            pending_language=result.pending_language,
+            pending_frames=result.pending_frames,
+            next_seq=result.next_seq,
+        )
+        if final:
+            # 首次处理 final 块：封存并把回执改写为封存后的完整区间。
+            # 缓存保持"封存前快照 + final=True"，重放时据此重建同样的封存回执。
+            self.seal()
+            result.segments = list(self._final_segments or [])
+            result.open_segment = None
         return result
 
     def seal(self) -> List[Segment]:
@@ -260,6 +305,7 @@ class LanguageSmoother:
         if self._open_segment is not None:
             # 尾段已通过连续帧阈值确认，按最后一帧封口。
             if last >= self._open_segment.start_frame:
+                # 封口改动的是索引中最后一个尾段对象（已关闭区间从不修改中间项）。
                 self._open_segment.end_frame = last
                 self._segments.append(self._open_segment)
             self._open_segment = None
@@ -299,19 +345,35 @@ class LanguageSmoother:
         return arr
 
     # ---------------------------------------------------------------- 内部实现
-    def _rebuild_cached(self, cached: dict) -> ChunkResult:
-        r: ChunkResult = cached["result"]
+    def _rebuild_cached(self, start_seq: int, cached: _CachedChunk) -> ChunkResult:
+        """从 O(1) 快照重建当时的回执，不触碰状态机、不重跑 HMM。"""
+        if cached.final:
+            # 首次处理 final 块时即已封存：回执 = 封存后的完整区间。
+            return ChunkResult(
+                session_id=self.session_id,
+                start_seq=start_seq,
+                end_seq=cached.end_seq,
+                duplicate=True,
+                segments=list(self._final_segments or []),
+                open_segment=None,
+                current_language=cached.current_language,
+                pending_language=cached.pending_language,
+                pending_frames=cached.pending_frames,
+                next_seq=cached.next_seq,
+            )
+        # 普通块：只取当时已关闭的前缀（后续追加的区间不属于这条回执），
+        # 尾段用当时的快照——之后确认切换即使让切点回退也不影响旧回执。
         return ChunkResult(
-            session_id=r.session_id,
-            start_seq=r.start_seq,
-            end_seq=r.end_seq,
+            session_id=self.session_id,
+            start_seq=start_seq,
+            end_seq=cached.end_seq,
             duplicate=True,
-            segments=list(r.segments),
-            open_segment=_copy_segment(r.open_segment),
-            current_language=r.current_language,
-            pending_language=r.pending_language,
-            pending_frames=r.pending_frames,
-            next_seq=r.next_seq,
+            segments=list(self._segments[: cached.closed_count]),
+            open_segment=_copy_segment(cached.open_segment),
+            current_language=cached.current_language,
+            pending_language=cached.pending_language,
+            pending_frames=cached.pending_frames,
+            next_seq=cached.next_seq,
         )
 
     def _apply(self, start_seq: int, end_seq: int, posteriors: np.ndarray) -> ChunkResult:

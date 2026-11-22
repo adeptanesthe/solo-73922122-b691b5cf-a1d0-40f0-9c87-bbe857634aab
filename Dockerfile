@@ -26,6 +26,14 @@ COPY tests ./tests
 CMD ["pytest"]
 
 
+# ---- 演示镜像：docker compose --profile demo run --rm demo ---------------
+FROM base AS demo
+
+COPY examples ./examples
+
+CMD ["python", "examples/demo.py", "http://segmenter:8000"]
+
+
 # ---- 运行镜像 ------------------------------------------------------------
 FROM base AS runtime
 

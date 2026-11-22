@@ -10,9 +10,10 @@
   已确认区间。
 - 只有新语种**连续达到阈值帧数**才切段；低置信帧沿用上一状态；单帧抖动
   不会切段。
-- 完全重复的块返回**原结果**且不改变会话；迟到 / 越界 / 冲突块**一律拒绝**
-  且不改变会话。
-- 提交 `final: true`（或调用 `/seal`）后**封存**区间，之后不再接受新块。
+- 完全重复的块（内容、长度、`final` 均相同）返回**当时的结果快照**且不改变
+  会话、不重跑 HMM；迟到 / 越界 / 冲突块**一律拒绝**且不改变会话。
+- 提交 `final: true`（或调用 `/seal`）后**封存**区间，之后不再接受新块；
+  带 `final` 的末块重送返回封存后的同一批区间。
 
 ---
 
@@ -28,7 +29,7 @@ docker compose up --build
 
 ```bash
 python -m pip install -r requirements-dev.txt
-python -m pytest -q                     # 17 个单元/接口用例
+python -m pytest -q                     # 23 个单元/接口用例
 uvicorn app.main:app --port 8000
 python examples/demo.py http://127.0.0.1:8000
 # 可选：真实 HTTP 端到端测试
@@ -41,8 +42,23 @@ Docker 下跑测试（compose 的 `test` profile，会等 `segmenter` healthy �
 docker compose --profile test run --rm tests
 ```
 
+Docker 下看重送演示（compose 的 `demo` profile，同样等 `segmenter` healthy）：
+
+```bash
+docker compose up --build -d
+docker compose --profile demo run --rm demo
+docker compose down
+```
+
 `examples/demo.py` 只依赖标准库，演示了创建会话、正常分块、重复块、迟到块、
-越界块、低置信尾帧、封存与封存后提交。
+越界块、低置信尾帧、封存与封存后提交；末尾两段专门演示重送语义：
+
+- **A. 带 `final` 的末块原样重送**：首次回执 → 原样重送 → `GET /segments`，
+  三者区间一致、`open_segment: null`；同序号仅把 `final` 改为 `false` 返回
+  409 且封存状态不变；封存后重送普通块返回当时的回执、`sealed: true`。
+- **B. 普通块重送**：先是候选切换进行中的回执（尾段 `zh 0..5`、`pending_frames:
+  1`），随后确认切换把切点回退到 4；重送旧块仍返回当时的 `zh 0..5` 尾段与
+  切换进度，而不是当前已关闭的区间。
 
 ---
 
@@ -97,7 +113,9 @@ docker compose --profile test run --rm tests
 
 - `start_seq`：本块第一帧的**全局序号**，从 0 开始，必须等于 `next_seq`。
 - `posteriors`：形状 `(帧数, 语种数)`，每行非负、和 > 0（内部会归一化）。
-- `final`：置 `true` 等价于在本块处理成功后立即封存会话。
+- `final`：置 `true` 等价于在本块处理成功后立即封存会话；本块仍按普通块
+  推进分段，只是回执中的 `segments` 是**封存后**的完整区间、`open_segment`
+  为 `null`、`sealed` 为 `true`。
 
 响应 `200`：
 
@@ -123,9 +141,13 @@ docker compose --profile test run --rm tests
 ```
 
 - `segments`：**已关闭**区间（一旦关闭不会再变），闭区间 `start_frame..end_frame`。
-- `open_segment`：已通过阈值确认、仍在延伸的当前区间（快照）。
-- `pending_language` / `pending_frames`：尚未达到阈值的候选切换进度。
-- `next_seq`：下一块的期望 `start_seq`。
+  重送回执给的是**该块首次处理时**的已关闭区间，不包含之后才关闭的区间。
+- `open_segment`：该块首次处理时已通过阈值确认、仍在延伸的区间的**快照**。
+  之后确认切换即使让切点回退，旧回执里的尾段也不会被改写。
+- `pending_language` / `pending_frames`：该块首次处理时尚未达到阈值的候选切换进度。
+- `duplicate`：本次请求是否是原样重送（内容、长度、`final` 都命中缓存）。
+- `sealed`：**当前**会话封存状态（不是回执生成时的状态）。
+- `next_seq`：该块首次处理后的期望 `start_seq`（重送不推进）。
 
 ### 2.3 其它端点
 
@@ -145,7 +167,7 @@ docker compose --profile test run --rm tests
 | 404 | — | 会话不存在 |
 | 409 | `late_chunk` | `start_seq` < 期望序号（迟到/重放旧块但内容不同） |
 | 409 | `out_of_order` | `start_seq` > 期望序号（越界、有缺口） |
-| 409 | `chunk_conflict` | 同一 `start_seq` 已提交过，但内容或长度不同 |
+| 409 | `chunk_conflict` | 同一 `start_seq` 已提交过，但内容、长度或 `final` 不同（同序号只改 `final` 也在此列） |
 | 409 | `session_sealed` | 封存后提交新块 |
 | 413 | `chunk_too_large` | 单块超过 100 000 帧 |
 | 422 | `dimension_mismatch` / `negative_probability` / `invalid_distribution` / `non_finite` / `invalid_seq` / `empty_chunk` | 参数或数据校验失败 |
@@ -163,7 +185,7 @@ docker compose --profile test run --rm tests
 ```
 app/smoother.py   核心状态机（纯 NumPy，可独立测试）
 app/main.py       FastAPI 路由、Pydantic 校验、错误映射、会话表
-tests/test_api.py 17 个自测用例
+tests/test_api.py 23 个自测用例 + 2 个可选 HTTP 用例
 examples/demo.py  端到端调用示例
 ```
 
@@ -203,20 +225,32 @@ log A(i,i) = 0,  log A(i,j) = -penalty (i≠j),  逐行 logsumexp 归一
 4. **封存**：`seal` 把仍在延伸的尾段按最后一帧关闭（该段此前已通过阈值
    确认），之后会话只读。
 
-已关闭的 `segments` 是追加式列表、元素不可变；重放或后续块返回的都是同一
-批对象的内容，因此"已确认区间"对客户端是单调、稳定的。
+已关闭的 `segments` 是追加式列表、元素不可变；后续块只在末尾追加，不会
+改写已有关闭区间，因此"已确认区间"对客户端是单调、稳定的。唯一的"回退"
+发生在确认层的尾段上：后续确认切换会把切点回退到候选起点，这只影响当前
+尾段；各块回执保存的是当时尾段的独立快照，不受影响。
 
-### 3.3 幂等、顺序与封存
+### 3.3 幂等、重送回执与封存
 
-- 每个被接受的块以 `start_seq` 为键缓存：结果快照 + 块长 + 内容指纹
-  （形状 + 量化到 1e-9 的字节 SHA-256）。
-- 命中缓存且长度、指纹一致 → 返回原结果并置 `duplicate: true`，**不重放**
-  状态机，因此不会重复推进 `next_seq`，也不会改变候选切换计数。
-- 命中缓存但内容/长度不同 → `409 chunk_conflict`。
-- 未命中缓存时，`start_seq` 必须精确等于 `next_seq`：小于即 `late_chunk`，
+- **缓存内容**：每个被接受的块以 `start_seq` 为键保存一份 O(1) 快照：
+  块长、内容指纹（形状 + 量化到 1e-9 的字节 SHA-256）、`final` 标志、
+  **当时已关闭区间数量**、当时的尾段副本、切换进度与 `next_seq`。缓存不复制
+  整份区间列表，因此单会话长期占用随"已收块数 + 已关闭区间数"线性增长。
+- **判定顺序**：先查缓存，再判断封存与序号。命中缓存且长度、指纹、`final`
+  三者一致 → 用快照重建回执并置 `duplicate: true`，**不重跑 HMM**、不推进
+  `next_seq`、不改候选切换计数；任一不一致 → `409 chunk_conflict`，状态不变。
+- **回执语义**：重送回执描述的是**该块首次处理时**的视图——已关闭区间取当时
+  的前缀，尾段与切换进度取当时的快照。后续追加的区间、后续确认切换造成的
+  切点回退都不会改写旧回执。
+- **`final` 块**：首次处理时就"处理本块 + 封存 + 缓存"一次完成，缓存的是
+  封存前的状态快照加 `final=True`；首次回执与重送回执都据此重建为封存后的
+  完整区间（`open_segment: null`、末段与首次回执及 `GET /segments` 一致），
+  不会把已封存的末段标成临时尾段。`sealed` 始终报告当前封存状态。
+- **未命中缓存时**，`start_seq` 必须精确等于 `next_seq`：小于即 `late_chunk`，
   大于即 `out_of_order`，两者都不触碰状态机。
-- 封存后：未缓存的块返回 `session_sealed`；**已缓存的块仍返回原结果**
-  （便于客户端安全重试），响应中 `sealed: true`。
+- **封存后**：未缓存的块返回 `session_sealed`；**已缓存的块仍返回当时的回执**
+  （便于客户端安全重试）。封存本身不修改任何已关闭区间，只把当前尾段按最后
+  一帧追加封口。
 
 ### 3.4 并发
 
@@ -230,12 +264,13 @@ log A(i,i) = 0,  log A(i,j) = -penalty (i≠j),  逐行 logsumexp 归一
 
 ```bash
 python -m pytest -q
-# 17 passed
+# 23 passed, 2 skipped（未设置 SEGMENTER_BASE_URL 时 2 个真实 HTTP 用例跳过）
 ```
 
 另有 `tests/test_live.py`：设置 `SEGMENTER_BASE_URL` 后对真实运行中的服务发起
 HTTP 请求，覆盖健康检查、建会话、正常块、重复块、迟到块、切换 + `final`
-封存、封存后拒绝；未设置环境变量时自动跳过。
+封存、封存后拒绝，以及 `final` 末块重送与普通块重送（含切点回退）；未设置
+环境变量时自动跳过。
 
 覆盖的场景：
 
@@ -250,6 +285,12 @@ HTTP 请求，覆盖健康检查、建会话、正常块、重复块、迟到块
 | `test_duplicate_chunk_returns_original_result_and_keeps_state` | 重复块返回原结果、`next_seq` 不变、会话状态逐字段不变 |
 | `test_duplicate_with_different_content_conflicts` | 同起点不同内容 → 409 且状态不变 |
 | `test_duplicate_after_seal_still_returns_original` | 封存后重放已缓存块仍返回原结果 |
+| `test_final_last_chunk_resend_matches_first_receipt_and_seal_query` | `final` 末块原样重送：回执与首次、`GET /segments` 一致，`open_segment` 为 null，末段不被标成临时尾段 |
+| `test_same_seq_only_final_changed_returns_409_and_keeps_state` | 同序号仅改 `final`（两个方向）→ 409 且会话/封存状态不变 |
+| `test_normal_chunk_resend_returns_receipt_as_of_then` | 普通块重送返回当时的已关闭区间、尾段、切换进度与 `next_seq` |
+| `test_old_receipt_keeps_its_tail_when_later_switch_regresses_cut` | 后续确认切换让切点回退（5→4），旧回执仍保留当时的尾段 `zh 0..5` |
+| `test_resend_does_not_rerun_hmm` | 重送不调用前向滤波、滤波状态逐位不变 |
+| `test_session_memory_grows_linearly_with_chunks_plus_closed_segments` | 单会话可达 `Segment` 对象数 ≤ 已收块数 + 已关闭区间数 + 3 |
 | `test_late_chunk_rejected_without_state_change` | 迟到块 → 409 `late_chunk` 且状态不变 |
 | `test_out_of_order_chunk_rejected_without_state_change` | 越界块 → 409 `out_of_order` 且状态不变，随后正确序号可提交 |
 | `test_frame_by_frame_equals_single_chunk` | 逐帧提交与单块提交的最终区间完全一致 |
@@ -281,10 +322,16 @@ docker compose down
 - `chunk 2 (ja x5 + low-confidence x2)` → 切到 ja，两帧低置信并入 ja 段。
 - `seal` 后 `segments` 为 `zh 0..7`、`en 8..14`、`ja 15..21`，覆盖全部 22 帧
   且不重叠；封存后新块 409 `session_sealed`。
+- A 段：`final` 末块首次回执 / 原样重送 / `GET /segments` 三者区间一致
+  （`en 5..9`），重送 `open_segment: null`；仅改 `final` → 409；封存后重送
+  普通块返回当时的空 `segments` 和尾段 `zh 0..4`、`sealed: true`。
+- B 段：重送候选切换中的块返回当时的尾段 `zh 0..5`、`pending_frames: 1`、
+  `next_seq: 6`，即使之后确认切换已把切点回退到 4。
 
 > 说明：本次交付环境未安装 Docker，`docker compose up` 未能在本机实际执行；
-> Dockerfile / compose 按标准写法提供，服务本身已用 `uvicorn` 真实启动并跑通
-> 上述端到端示例与全部单测。
+> Dockerfile / compose（含 `test`、`demo` 两个 profile）按标准写法提供，
+> `docker-compose.yml` 已用 YAML 解析校验，服务本身已用 `uvicorn` 真实启动并
+> 跑通上述演示与全部单测、`tests/test_live.py` 真实 HTTP 测试。
 
 ---
 
@@ -293,7 +340,10 @@ docker compose down
 1. **无持久化与多实例**：会话与幂等缓存都在进程内存，服务重启即丢失；单
    worker 部署。生产化需要把状态机快照/块结果放到 Redis 或数据库，并按
    `session_id` 做一致性路由或加分布式锁。
-2. **无会话过期清理**：长时间运行会累积内存。应加 TTL / LRU 淘汰。
+2. **无会话过期清理**：长时间运行会累积内存。单会话占用已随"已收块数 +
+   已关闭区间数"线性增长（见 `test_session_memory_grows_linearly_...`），
+   但仍应加 TTL / LRU 淘汰。若要进一步压缩，可把已封存区间移出热路径，
+   或只保留每个块的哈希而不保留快照。
 3. **只有前向滤波，没有维特比回溯**：当前段一旦关闭不会因后续帧修正。
    对"整段最优"有要求时，可在封存时对保留的观测做一次离线 Viterbi 重解码
    并重发最终区间（API 已把最终区间集中在 `/segments`，便于替换）。

@@ -44,3 +44,16 @@ services:
     environment:
       SEGMENTER_BASE_URL: http://segmenter:8000
     command: ["pytest", "-q"]
+
+  # 演示重送语义：docker compose --profile demo run --rm demo
+  # 会等 segmenter healthy 后依次展示 final 末块重送、普通块重送与 409 冲突。
+  demo:
+    profiles: ["demo"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: demo
+    depends_on:
+      segmenter:
+        condition: service_healthy
+    command: ["python", "examples/demo.py", "http://segmenter:8000"]

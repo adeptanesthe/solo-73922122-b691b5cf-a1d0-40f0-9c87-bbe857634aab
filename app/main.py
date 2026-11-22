@@ -20,6 +20,8 @@ app = FastAPI(
         "把流式语种识别的逐帧后验整理成稳定语种区间。"
         "会话设定 2~4 个语种、帧长、切换连续帧数与后验阈值；"
         "服务用带切换惩罚的 HMM 平滑状态，只在满足连续帧阈值时切段。"
+        "原样重送块返回首次处理时的回执（不重跑 HMM、不改变会话）；"
+        "带 final 的末块重送返回与封存查询一致的完整区间。"
     ),
 )
 
@@ -61,7 +63,10 @@ class ChunkSubmit(BaseModel):
     posteriors: List[List[float]] = Field(
         ..., description="形状 (帧数, 语种数) 的后验概率"
     )
-    final: bool = Field(False, description="置 true 等价于随后调用 /seal")
+    final: bool = Field(
+        False,
+        description="置 true 表示本块为末块：处理成功后立即封存，回执即封存后的完整区间",
+    )
 
     @model_validator(mode="after")
     def _check_posteriors(self) -> "ChunkSubmit":
@@ -164,17 +169,12 @@ def submit_chunk(session_id: str, body: ChunkSubmit) -> dict:
     s = _get(session_id)
     arr = np.asarray(body.posteriors, dtype=np.float64)
     with _lock:
-        result: ChunkResult = s.submit_chunk(body.start_seq, arr)
-        sealed_now = False
-        if body.final and not s.sealed:
-            s.seal()
-            sealed_now = True
-        payload = result.to_dict(sealed=s.sealed)
-        if sealed_now:
-            # final 触发的封存会把尾段并入最终区间，响应反映封存后的完整列表。
-            payload["segments"] = [seg.to_dict() for seg in s.final_segments()]
-            payload["open_segment"] = None
-    return payload
+        # final 块在状态机内部"处理 + 封存 + 缓存"一次完成：首次回执与重放
+        # 回执都来自同一份封存快照，末块区间不会变成临时尾段。
+        result: ChunkResult = s.submit_chunk(
+            body.start_seq, arr, final=body.final
+        )
+        return result.to_dict(sealed=s.sealed)
 
 
 @app.post("/sessions/{session_id}/seal", response_model=SealOut)
